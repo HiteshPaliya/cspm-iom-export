@@ -1,6 +1,7 @@
 import os
 import sys
 import pandas as pd
+import concurrent.futures
 from falconpy import ConfigurationAssessment, CloudSecurityAssets, OAuth2
 
 def get_credentials():
@@ -22,9 +23,7 @@ def get_ioms(config_assessment_client, subscription_id, limit=5000):
     print(f"Fetching Unresolved IOMs for Subscription ID: {subscription_id}...")
     
     # FQL Filter:
-    # 1. account_id matches
-    # 2. status is Open or Reopen (Unresolved)
-    # Note: Adjust status values based on your specific environment usage if needed.
+    # Optimized to filter as much as possible on the server side.
     filters = f"account_id:'{subscription_id}'+status:['Open','Reopen','New']"
     
     all_findings = []
@@ -32,6 +31,7 @@ def get_ioms(config_assessment_client, subscription_id, limit=5000):
     total = 0
     
     while True:
+        # get_combined_assessments is optimized: it fetches IDs and Details in one go.
         response = config_assessment_client.get_combined_assessments(
             filter=filters,
             limit=limit,
@@ -63,8 +63,6 @@ def get_ioms(config_assessment_client, subscription_id, limit=5000):
 def filter_publicly_verifiable(findings):
     """
     Filter findings for 'Publicly Verifiable IOMs'.
-    This mimics the Saved Filter logic by checking for keywords in the description
-    or policy statement.
     """
     print("Filtering for 'Publicly Verifiable' findings...")
     filtered = []
@@ -72,7 +70,6 @@ def filter_publicly_verifiable(findings):
         description = finding.get("description", "").lower()
         policy = finding.get("policy_statement", "").lower()
         
-        # Heuristic for "Publicly Accessible/Verifiable"
         if "publicly accessible" in description or "publicly accessible" in policy:
             filtered.append(finding)
         elif "public" in description and "access" in description: 
@@ -83,15 +80,26 @@ def filter_publicly_verifiable(findings):
     print(f"Remaining findings after filter: {len(filtered)}")
     return filtered
 
+def fetch_asset_batch(cloud_assets_client, batch_ids):
+    """
+    Helper function to fetch a single batch of assets.
+    """
+    response = cloud_assets_client.get_assets(ids=batch_ids)
+    if response["status_code"] == 200:
+        return response["body"].get("resources", [])
+    else:
+        print(f"Warning: Failed to fetch assets for batch: {response['body']['errors']}")
+        return []
+
 def enrich_and_filter_assets(cloud_assets_client, findings):
     """
     Enrich findings with Cloud Asset details AND filter by Asset Status = Active.
-    Only returns IOMs where the associated asset is found and is Active.
+    Uses ThreadPoolExecutor for concurrent batch fetching to optimize speed.
     """
     if not findings:
         return []
 
-    print("Enriching findings and filtering for Active Assets...")
+    print("Enriching findings and filtering for Active Assets (Concurrent)...")
     
     enriched_data = []
     resource_ids = list(set([f.get("resource_id") for f in findings if f.get("resource_id")]))
@@ -100,30 +108,24 @@ def enrich_and_filter_assets(cloud_assets_client, findings):
     batch_size = 100
     assets_map = {}
     
-    for i in range(0, len(resource_ids), batch_size):
-        batch_ids = resource_ids[i:i+batch_size]
+    # Prepare batches
+    batches = [resource_ids[i:i+batch_size] for i in range(0, len(resource_ids), batch_size)]
+    
+    # Use ThreadPoolExecutor to fetch batches in parallel
+    # Max workers = 5 to be safe with rate limits, though Falcon API is robust.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        future_to_batch = {
+            executor.submit(fetch_asset_batch, cloud_assets_client, batch): batch 
+            for batch in batches
+        }
         
-        # We fetch the assets by ID.
-        # We can't easily filter by status=active in the get_assets(ids=...) call 
-        # because get_assets usually just returns what implies the ID.
-        # So we fetch then filter in python.
-        response = cloud_assets_client.get_assets(ids=batch_ids)
-        
-        if response["status_code"] == 200:
-            resources = response["body"].get("resources", [])
-            for asset in resources:
-                # Check Asset Status
-                # "status" field in asset resource
+        for future in concurrent.futures.as_completed(future_to_batch):
+            fetched_assets = future.result()
+            for asset in fetched_assets:
                 status = asset.get("status", "").lower()
-                if status == "active" or status == "running" or status == "ok": 
-                    # 'running'/'ok' depend on provider, but 'active' is standard Falcon state?
-                    # Let's assume 'active' or check if it's not 'terminated'/'deleted'.
-                    # For strictness, let's look for 'active'.
-                    # We will also accept if status is missing? No, user said Active.
-                    # Actually, let's print unique statuses found to help debug if it filters everything.
+                # Active filter
+                if status == "active" or status == "running" or status == "ok":
                     assets_map[asset.get("asset_id")] = asset
-        else:
-            print(f"Warning: Failed to fetch assets for batch {i}: {response['body']['errors']}")
 
     print(f"Found {len(assets_map)} Active assets associated with findings.")
 
@@ -147,7 +149,7 @@ def enrich_and_filter_assets(cloud_assets_client, findings):
     return enriched_data
 
 def main():
-    print("--- Falcon CSPM IOM Export Script (Filtered) ---")
+    print("--- Falcon CSPM IOM Export Script (Optimized) ---")
     
     # 1. Inputs
     sub_id = input("Enter the Subscription ID (Account ID): ").strip()
@@ -164,19 +166,19 @@ def main():
     config_client = ConfigurationAssessment(auth_object=auth)
     asset_client = CloudSecurityAssets(auth_object=auth)
     
-    # 4. Get IOMs (Filtered by Sub ID + Unresolved Status)
+    # 4. Get IOMs
     ioms = get_ioms(config_client, sub_id)
     if not ioms:
         print("No Unresolved IOMs found for this subscription.")
         return
 
-    # 5. Filter for 'Publicly Verifiable'
+    # 5. Filter for 'Publicly Verifiable' (Local Filter)
     filtered_ioms = filter_publicly_verifiable(ioms)
     if not filtered_ioms:
         print("No 'Publicly Verifiable' IOMs found.")
         return
 
-    # 6. Enrich with Assets and Filter for 'Active' Assets
+    # 6. Enrich with Assets (Concurrent + Filter Active)
     final_data = enrich_and_filter_assets(asset_client, filtered_ioms)
     
     if not final_data:
